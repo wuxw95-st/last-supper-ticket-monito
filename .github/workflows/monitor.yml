@@ -1,6 +1,8 @@
 name: Last Supper ticket monitor
 
 on:
+  push:
+    branches: [main]
   schedule:
     # GitHub's minimum interval is 5 minutes. Offset from the top of the hour.
     - cron: "2/5 * 15-30 9 *"
@@ -32,5 +34,16 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
+      - name: Send one-time setup test push
+        if: github.event_name == 'push'
+        run: |
+          python - <<'PY'
+          from monitor import send_bark
+          send_bark(
+              "最后的晚餐余票监控",
+              "云端监控已经启动。之后发现 2026-10-06 余票时会立即通知你。",
+              urgent=True,
+          )
+          PY
       - name: Check 2026-10-06 availability
         run: python check_once.py
