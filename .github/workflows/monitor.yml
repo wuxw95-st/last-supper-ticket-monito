@@ -35,7 +35,7 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - name: Send one-time setup test push
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && github.run_number == 1
         run: |
           python - <<'PY'
           from monitor import send_bark
