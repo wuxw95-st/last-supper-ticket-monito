@@ -7,6 +7,9 @@ on:
     # GitHub's minimum interval is 5 minutes. Offset from the top of the hour.
     - cron: "2/5 * 15-30 9 *"
     - cron: "2/5 * 1-6 10 *"
+    # Daily health heartbeat at about 09:07 China/Singapore time (01:07 UTC).
+    - cron: "7 1 16-30 9 *"
+    - cron: "7 1 1-6 10 *"
   workflow_dispatch:
 
 permissions:
@@ -47,3 +50,14 @@ jobs:
           PY
       - name: Check 2026-10-06 availability
         run: python check_once.py
+      - name: Send daily health heartbeat
+        if: github.event.schedule == '7 1 16-30 9 *' || github.event.schedule == '7 1 1-6 10 *'
+        run: |
+          python - <<'PY'
+          from monitor import send_bark
+          send_bark(
+              "最后的晚餐监控正常",
+              "每日状态：云端监控本次检查成功。如发现 2026-10-06 余票，会另发紧急通知。",
+              urgent=False,
+          )
+          PY
