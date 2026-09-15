@@ -210,7 +210,11 @@ async def _move_to_target_month(page: Page) -> None:
 
 async def check_availability(page: Page) -> Availability:
     await page.goto(EVENT_URL, wait_until="domcontentloaded", timeout=60_000)
-    await page.wait_for_selector("#dayOfTheMonth_151991", timeout=30_000)
+    # The calendar list exists in the DOM before it is shown. Waiting for the
+    # default "visible" state times out even though the ticket data is ready.
+    await page.wait_for_selector(
+        "#dayOfTheMonth_151991", state="attached", timeout=30_000
+    )
 
     decline = page.get_by_role("button", name="I decline")
     if await decline.is_visible():
