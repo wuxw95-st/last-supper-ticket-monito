@@ -30,6 +30,8 @@ jobs:
       BROWSER_CHANNEL: chrome
       HEADLESS: "true"
       LOG_LEVEL: INFO
+      MIN_SEATS: "2"
+      LATEST_ENTRY_TIME: "16:30"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
