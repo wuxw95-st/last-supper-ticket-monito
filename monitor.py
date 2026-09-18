@@ -116,6 +116,15 @@ def is_time_before_cutoff(value: str, cutoff: str = LATEST_ENTRY_TIME) -> bool:
     return value < cutoff
 
 
+def eligible_times(values: Iterable[str], cutoff: str = LATEST_ENTRY_TIME) -> list[str]:
+    """Return only unique, valid time slots strictly before the cutoff."""
+    return sorted({
+        value.strip()
+        for value in values
+        if is_time_before_cutoff(value.strip(), cutoff)
+    })
+
+
 def send_email(subject: str, text_body: str, html_body: str) -> None:
     if not email_is_configured():
         raise RuntimeError("邮件配置不完整")
@@ -267,8 +276,15 @@ async def check_availability(page: Page) -> Availability:
             for token in raw.replace("\n", " ").split()
             if len(token) == 5 and token[2] == ":" and token.replace(":", "").isdigit()
         })
-        times = [value for value in all_times if is_time_before_cutoff(value)]
-        if all_times and not times:
+        times = eligible_times(all_times)
+        # A selectable calendar day is only a preliminary signal. Vivaticket
+        # loads the actual timetable separately, and that request can be empty
+        # when inventory is gone or the request is challenged. Never alert
+        # unless a concrete eligible time is present.
+        if not all_times:
+            unavailable = True
+            status = "No purchasable time slots returned"
+        elif not times:
             unavailable = True
             status = f"Only times at or after {LATEST_ENTRY_TIME}: {', '.join(all_times)}"
         SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
