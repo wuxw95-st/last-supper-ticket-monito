@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import random
+import re
 import smtplib
 import ssl
 import urllib.error
@@ -31,6 +32,8 @@ EVENT_URL = os.getenv(
 )
 TARGET_MONTH = os.getenv("TARGET_MONTH", "OCTOBER 2026").upper()
 TARGET_DAY = int(os.getenv("TARGET_DAY", "6"))
+MIN_SEATS = max(1, int(os.getenv("MIN_SEATS", "2")))
+LATEST_ENTRY_TIME = os.getenv("LATEST_ENTRY_TIME", "16:30").strip()
 CHECK_INTERVAL_SECONDS = max(60, int(os.getenv("CHECK_INTERVAL_SECONDS", "120")))
 INTERVAL_JITTER_SECONDS = max(0, int(os.getenv("INTERVAL_JITTER_SECONDS", "15")))
 REMINDER_INTERVAL_SECONDS = max(300, int(os.getenv("REMINDER_INTERVAL_SECONDS", "600")))
@@ -102,6 +105,15 @@ def is_day_available(classes: Iterable[str], title: str) -> bool:
     class_set = set(classes)
     normalized_title = title.strip().lower()
     return not ({"inactive", "no-event"} & class_set or "not available" in normalized_title)
+
+
+def is_time_before_cutoff(value: str, cutoff: str = LATEST_ENTRY_TIME) -> bool:
+    """Return True only for valid HH:MM values strictly before the cutoff."""
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+        return False
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", cutoff):
+        raise ValueError(f"无效的最晚入场时间：{cutoff}")
+    return value < cutoff
 
 
 def send_email(subject: str, text_body: str, html_body: str) -> None:
@@ -220,6 +232,15 @@ async def check_availability(page: Page) -> Availability:
     if await decline.is_visible():
         await decline.click()
 
+    # Ask the official calendar to show only dates with at least the requested
+    # number of seats. This prevents a single returned ticket from alerting us.
+    if MIN_SEATS > 1:
+        seat_filter = page.get_by_role("button", name=str(MIN_SEATS), exact=True)
+        if await seat_filter.count() != 1:
+            raise RuntimeError(f"找不到至少 {MIN_SEATS} 张票的官方筛选按钮")
+        await seat_filter.click()
+        await page.wait_for_timeout(800)
+
     await _move_to_target_month(page)
     selector = f"#dayOfTheMonth_151991 li.cal10{TARGET_DAY}"
     day = page.locator(selector)
@@ -235,16 +256,21 @@ async def check_availability(page: Page) -> Availability:
 
     if not unavailable:
         await day.click()
-        await page.wait_for_timeout(900)
+        await page.wait_for_timeout(1_500)
         time_candidates = await page.locator(
-            "button, a, label, li"
+            "#timeCalFascie_151991 button, #timeCalFascie_151991 a, "
+            "#timeCalFascie_151991 label, #timeCalFascie_151991 li"
         ).all_inner_texts()
-        times = sorted({
+        all_times = sorted({
             token.strip()
             for raw in time_candidates
             for token in raw.replace("\n", " ").split()
             if len(token) == 5 and token[2] == ":" and token.replace(":", "").isdigit()
         })
+        times = [value for value in all_times if is_time_before_cutoff(value)]
+        if all_times and not times:
+            unavailable = True
+            status = f"Only times at or after {LATEST_ENTRY_TIME}: {', '.join(all_times)}"
         SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
         shot = SCREENSHOT_DIR / f"available-{datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
         await page.screenshot(path=str(shot), full_page=True)
@@ -264,10 +290,11 @@ async def check_availability(page: Page) -> Availability:
 
 def _availability_mail(result: Availability, reminder: bool = False) -> tuple[str, str, str]:
     prefix = "再次提醒" if reminder else "发现余票"
-    subject = f"【{prefix}】最后的晚餐 2026-10-06 门票可购买"
-    time_text = "、".join(result.times) if result.times else "官网已显示当天可选，请立即进入查看"
+    subject = f"【{prefix}】最后的晚餐 2026-10-06 至少2张票可购买"
+    time_text = "、".join(result.times) if result.times else f"官网显示至少 {MIN_SEATS} 个名额，请立即进入核对时间"
     text_body = (
-        f"{prefix}：米兰《最后的晚餐》2026 年 10 月 6 日门票可能可以购买。\n\n"
+        f"{prefix}：米兰《最后的晚餐》2026 年 10 月 6 日至少 {MIN_SEATS} 个标准入场名额可能可以购买。\n"
+        f"目标：{LATEST_ENTRY_TIME} 前入场；结账时选择 {MIN_SEATS} 张全价票（每张 €15），不要附加票。\n\n"
         f"可见时间：{time_text}\n检查时间（UTC）：{result.checked_at}\n"
         f"立即购票：{EVENT_URL}\n\n热门票可能很快售罄，请以结算页为准。"
     )
