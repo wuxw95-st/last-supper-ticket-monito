@@ -112,3 +112,10 @@ docker compose stop
 ## 重要说明
 
 网页结构、网络故障、验证码或网站限制都可能影响监控；最终余票以官方结算页为准。建议保留原有 ChatGPT 每小时监控，作为独立备用通知。
+
+
+## Cloudflare 一键检测
+
+先部署只读检测版，验证 Cloudflare 是否能读取 Vivaticket 的实际时间表。检测版不会通知、不会下单，也不会保存任何凭据。
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/wuxw95-st/last-supper-ticket-monito/tree/main/cloudflare-worker)
