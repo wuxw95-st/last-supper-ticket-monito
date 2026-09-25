@@ -118,11 +118,7 @@ def is_time_before_cutoff(value: str, cutoff: str = LATEST_ENTRY_TIME) -> bool:
 
 def eligible_times(values: Iterable[str], cutoff: str = LATEST_ENTRY_TIME) -> list[str]:
     """Return only unique, valid time slots strictly before the cutoff."""
-    return sorted({
-        value.strip()
-        for value in values
-        if is_time_before_cutoff(value.strip(), cutoff)
-    })
+    return sorted({value.strip() for value in values if is_time_before_cutoff(value.strip(), cutoff)})
 
 
 def send_email(subject: str, text_body: str, html_body: str) -> None:
@@ -229,6 +225,95 @@ async def _move_to_target_month(page: Page) -> None:
     raise RuntimeError(f"12 次翻页后仍找不到 {TARGET_MONTH}")
 
 
+def _target_ticket_codes(source: str) -> tuple[str, str]:
+    """Extract the official timetable identifiers for 2026-10-06."""
+    pattern = re.compile(
+        r"eventi\[['\"]151991['\"]\]\.push\(new Array\s*\(\s*"
+        r"['\"](?P<tcode>[^'\"]+)['\"]\s*,\s*"
+        r"['\"](?P<pcode>[^'\"]+)['\"]\s*,\s*"
+        r"new Date\s*\(\s*(?P<year>\d{4})\s*,\s*"
+        r"\(\s*(?P<month>\d{1,2})\s*-\s*1\s*\)\s*,\s*"
+        r"(?P<day>\d{1,2})\s*\)"
+    )
+    for match in pattern.finditer(source):
+        if (
+            int(match.group("year")) == 2026
+            and int(match.group("month")) == 10
+            and int(match.group("day")) == TARGET_DAY
+        ):
+            return match.group("tcode"), match.group("pcode")
+    raise RuntimeError("官方页面中找不到 2026-10-06 的时间表标识")
+
+
+async def _official_timetable(page: Page) -> tuple[list[str], list[str]]:
+    """Return all times and times with at least MIN_SEATS before the cutoff."""
+    tcode, pcode = _target_ticket_codes(await page.content())
+    response = await page.evaluate(
+        """
+        async ({tcode, pcode, minSeats}) => {
+          const body = new URLSearchParams({
+            ajax: "1",
+            cal: "1",
+            tcode,
+            pcode,
+            "seat-filter": String(minSeats),
+          });
+          const result = await fetch("/eventoWidgetTlite.php", {
+            method: "POST",
+            credentials: "include",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+              "X-Requested-With": "XMLHttpRequest",
+            },
+            body,
+          });
+          return {
+            status: result.status,
+            contentType: result.headers.get("content-type") || "",
+            text: await result.text(),
+          };
+        }
+        """,
+        {"tcode": tcode, "pcode": pcode, "minSeats": MIN_SEATS},
+    )
+    status = int(response.get("status", 0))
+    body = str(response.get("text", "")).strip()
+    if status // 100 != 2:
+        raise RuntimeError(f"官方时间表接口返回 HTTP {status}")
+    if re.search(r"Incapsula|Queue-it|verify you are human|<html", body, re.I):
+        raise RuntimeError("官方时间表请求被安全验证页面拦截")
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"官方时间表返回格式异常：{body[:120]!r}"
+        ) from exc
+
+    if isinstance(parsed, list):
+        slots = parsed
+    elif isinstance(parsed, dict) and isinstance(parsed.get("data"), list):
+        slots = parsed["data"]
+    else:
+        raise RuntimeError("官方时间表未返回场次数组")
+
+    all_times: set[str] = set()
+    eligible: set[str] = set()
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        value = str(slot.get("ora", "")).strip()
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+            continue
+        all_times.add(value)
+        try:
+            seats = int(slot.get("d", 0))
+        except (TypeError, ValueError):
+            seats = 0
+        if seats >= MIN_SEATS and is_time_before_cutoff(value):
+            eligible.add(value)
+    return sorted(all_times), sorted(eligible)
+
+
 async def check_availability(page: Page) -> Availability:
     await page.goto(EVENT_URL, wait_until="domcontentloaded", timeout=60_000)
     # The calendar list exists in the DOM before it is shown. Waiting for the
@@ -241,52 +326,23 @@ async def check_availability(page: Page) -> Availability:
     if await decline.is_visible():
         await decline.click()
 
-    # Ask the official calendar to show only dates with at least the requested
-    # number of seats. This prevents a single returned ticket from alerting us.
-    if MIN_SEATS > 1:
-        seat_filter = page.get_by_role("button", name=str(MIN_SEATS), exact=True)
-        if await seat_filter.count() != 1:
-            raise RuntimeError(f"找不到至少 {MIN_SEATS} 张票的官方筛选按钮")
-        await seat_filter.click()
-        await page.wait_for_timeout(800)
-
-    await _move_to_target_month(page)
-    selector = f"#dayOfTheMonth_151991 li.cal10{TARGET_DAY}"
-    day = page.locator(selector)
-    if await day.count() != 1:
-        raise RuntimeError(f"目标日期元素异常：{selector} 匹配到 {await day.count()} 个")
-
-    classes = set((await day.get_attribute("class") or "").split())
-    title = (await day.get_attribute("title") or "").strip()
-    unavailable = not is_day_available(classes, title)
-    status = title or "available" if not unavailable else title or "unavailable"
-    times: list[str] = []
+    # Use Vivaticket's own timetable endpoint. The visible seat-filter button
+    # changes or disappears intermittently, while the endpoint supplies the
+    # exact availability count for every slot.
+    all_times, times = await _official_timetable(page)
+    unavailable = not times
+    if times:
+        status = f"Official timetable returned {len(times)} eligible slot(s)"
+    elif all_times:
+        status = (
+            f"No slot has at least {MIN_SEATS} seats before {LATEST_ENTRY_TIME}; "
+            f"visible times: {', '.join(all_times)}"
+        )
+    else:
+        status = "No purchasable time slots returned"
     screenshot: str | None = None
 
     if not unavailable:
-        await day.click()
-        await page.wait_for_timeout(1_500)
-        time_candidates = await page.locator(
-            "#timeCalFascie_151991 button, #timeCalFascie_151991 a, "
-            "#timeCalFascie_151991 label, #timeCalFascie_151991 li"
-        ).all_inner_texts()
-        all_times = sorted({
-            token.strip()
-            for raw in time_candidates
-            for token in raw.replace("\n", " ").split()
-            if len(token) == 5 and token[2] == ":" and token.replace(":", "").isdigit()
-        })
-        times = eligible_times(all_times)
-        # A selectable calendar day is only a preliminary signal. Vivaticket
-        # loads the actual timetable separately, and that request can be empty
-        # when inventory is gone or the request is challenged. Never alert
-        # unless a concrete eligible time is present.
-        if not all_times:
-            unavailable = True
-            status = "No purchasable time slots returned"
-        elif not times:
-            unavailable = True
-            status = f"Only times at or after {LATEST_ENTRY_TIME}: {', '.join(all_times)}"
         SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
         shot = SCREENSHOT_DIR / f"available-{datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
         await page.screenshot(path=str(shot), full_page=True)
